@@ -3,3 +3,6 @@
 
 # Dữ liệu Pi-hole khi chạy Docker (snapshot /etc/pihole)
 etc-pihole/
+
+# Root CA nội bộ xuất ra để import trên thiết bị khác (theo từng máy, không commit)
+certs/

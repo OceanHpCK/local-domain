@@ -49,17 +49,24 @@ CREATE_SERVICE=1
 # Cổng WebApp. Mặc định 80 để gõ tên miền là vào thẳng.
 APP_PORT="${APP_PORT:-80}"
 ADMIN_PORT="${ADMIN_PORT:-8080}"
+# Tên service systemd + tên dự án (mặc định: lấy từ tên thư mục app).
+APP_NAME="${VPS_APP_NAME:-}"
+# Module WSGI cho gunicorn (mặc định: tự dò app.py / wsgi.py).
+APP_MODULE="${VPS_APP_MODULE:-}"
+# Lệnh khởi động riêng cho server KHÔNG phải Python/gunicorn
+# (ví dụ: "node server.js", "npm start"). Đặt thì bỏ qua venv + gunicorn.
+START_CMD="${VPS_START_CMD:-}"
 CLI_LAN_IP="${LAN_IP:-}"
 CLI_UPSTREAM="${UPSTREAM_DNS:-}"
 CLI_APP_DIR="${VPS_APP_DIR:-}"
 
-for p in "$APP_PORT" "$ADMIN_PORT"; do
+valid_port() {
+    local p="$1"
     case "$p" in
-        '' | *[!0-9]*) echo "[x] Cổng không hợp lệ: $p" >&2; exit 1 ;;
+        '' | *[!0-9]*) return 1 ;;
     esac
-done
-[ "$APP_PORT" -ge 1 ] && [ "$APP_PORT" -le 65535 ] || { echo "[x] APP_PORT ngoài 1-65535" >&2; exit 1; }
-[ "$ADMIN_PORT" -ge 1 ] && [ "$ADMIN_PORT" -le 65535 ] || { echo "[x] ADMIN_PORT ngoài 1-65535" >&2; exit 1; }
+    [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
+}
 
 usage() {
     cat <<EOF
@@ -72,15 +79,21 @@ Khuyến nghị - chạy detached để terminal không thể ngắt cài đặt
 Tùy chọn:
   -h, --help              Hiển thị hướng dẫn
   --ip <IP LAN>           IP LAN để bind DNS (mặc định: tự dò qua route)
-  --app-dir <đường-dẫn>   Thư mục app để tạo venv + service systemd
-                          (mặc định: tự dò thư mục "vps-commander" nằm cạnh kit)
+  --app-dir <đường-dẫn>   Thư mục app (mặc định: tự dò thư mục "vps-commander"
+                          nằm cạnh kit; dùng được cho dự án Python bất kỳ)
   --domain <tên-miền>     Tên miền nội bộ (mặc định: vps.vn)
   --port <N>              Cổng WebApp (mặc định: 80)
   --admin-port <N>        Cổng quản trị Pi-hole (mặc định: 8080, áp dụng khi WebApp chiếm cổng 80)
+  --app-name <tên>        Tên service systemd (mặc định: tên thư mục app)
+  --app-module <m:w>      Module WSGI cho gunicorn (mặc định: tự dò app.py/wsgi.py)
+  --start-cmd "<lệnh>"    Lệnh khởi động riêng cho server KHÔNG phải Python
+                          (ví dụ: "node server.js", "npm start"). Khi đặt cờ này,
+                          script bỏ qua venv + gunicorn và chạy lệnh trên.
   --upstream "<IP>;IP"    DNS upstream (mặc định: 1.1.1.1;1.0.0.1)
   --no-service            Không tạo systemd cho WebApp
 
-Biến môi trường tương đương: LAN_IP, VPS_HOSTNAME, APP_PORT, ADMIN_PORT, UPSTREAM_DNS.
+Biến môi trường tương đương: LAN_IP, VPS_HOSTNAME, APP_PORT, ADMIN_PORT,
+VPS_APP_NAME, VPS_APP_MODULE, VPS_START_CMD, UPSTREAM_DNS.
 EOF
 }
 
@@ -93,9 +106,12 @@ while [ "$#" -gt 0 ]; do
         --no-service) CREATE_SERVICE=0 ;;
         --app-dir) [ $# -ge 2 ] || { echo "[x] --app-dir thiếu giá trị" >&2; exit 1; }; CLI_APP_DIR="$2"; shift ;;
         --ip) [ $# -ge 2 ] || { echo "[x] --ip thiếu giá trị" >&2; exit 1; }; CLI_LAN_IP="$2"; shift ;;
-        --domain) [ $# -ge 2 ] || { echo "[x] --domain thiếu giá trị" >&2; exit 1; }; DOMAIN="$2"; shift ;;
+        --domain) [ $# -ge 2 ] || { echo "[x] --domain thiếu giá trị" >&2; exit 1; }; DOMAIN="$2"; DOMAIN_FROM_CLI=1; shift ;;
         --port) [ $# -ge 2 ] || { echo "[x] --port thiếu giá trị" >&2; exit 1; }; APP_PORT="$2"; shift ;;
         --admin-port) [ $# -ge 2 ] || { echo "[x] --admin-port thiếu giá trị" >&2; exit 1; }; ADMIN_PORT="$2"; shift ;;
+        --app-name) [ $# -ge 2 ] || { echo "[x] --app-name thiếu giá trị" >&2; exit 1; }; APP_NAME="$2"; shift ;;
+        --app-module) [ $# -ge 2 ] || { echo "[x] --app-module thiếu giá trị" >&2; exit 1; }; APP_MODULE="$2"; shift ;;
+        --start-cmd) [ $# -ge 2 ] || { echo "[x] --start-cmd thiếu giá trị" >&2; exit 1; }; START_CMD="$2"; shift ;;
         --upstream) [ $# -ge 2 ] || { echo "[x] --upstream thiếu giá trị" >&2; exit 1; }; CLI_UPSTREAM="$2"; shift ;;
         *)
             echo "[x] Tùy chọn lạ: $1" >&2
@@ -106,7 +122,14 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
+for p in "$APP_PORT" "$ADMIN_PORT"; do
+    valid_port "$p" || { echo "[x] Cổng không hợp lệ (phải là số 1-65535): $p" >&2; exit 1; }
+done
 [ "$APP_PORT" -ne "$ADMIN_PORT" ] || { echo "[x] APP_PORT và ADMIN_PORT không được trùng nhau" >&2; exit 1; }
+[ -z "$APP_MODULE" ] || [ -z "$START_CMD" ] || {
+    echo "[x] Chỉ dùng một trong hai --app-module hoặc --start-cmd" >&2
+    exit 1
+}
 
 # Thư mục app (dùng ở phần 7: venv + service systemd cho WebApp)
 if [ -n "$CLI_APP_DIR" ]; then
@@ -115,11 +138,36 @@ if [ -n "$CLI_APP_DIR" ]; then
 else
     ROOT_DIR="$(find_app_dir)" || ROOT_DIR=""
 fi
-if [ "$CREATE_SERVICE" -eq 1 ] && [ ! -f "${ROOT_DIR:-/dev/null}/requirements.txt" ]; then
-    echo "[x] Không tìm thấy app (app.py/requirements.txt)." >&2
-    echo "    Truyền --app-dir /đường/dẫn/vps-commander, hoặc --no-service nếu chỉ cài DNS." >&2
+
+# Tên service systemd: lấy từ tên thư mục app (vd "vps-commander" ->
+# "vps-commander"), ghi đè bằng --app-name / VPS_APP_NAME.
+if [ -z "$APP_NAME" ]; then
+    if [ -n "$ROOT_DIR" ]; then
+        APP_NAME="$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')"
+    else
+        APP_NAME="vps-app"
+    fi
+fi
+case "$APP_NAME" in
+    '' | -* | *[!a-z0-9_.-]*) echo "[x] Tên service không hợp lệ: $APP_NAME (chỉ a-z 0-9 . _ -)" >&2; exit 1 ;;
+esac
+
+# Chỉ cần requirements.txt khi tạo service cho app Python (dùng gunicorn).
+# Với --start-cmd (server Node/Go/...) hoặc --no-service thì bỏ qua.
+if [ "$CREATE_SERVICE" -eq 1 ] && [ -z "$START_CMD" ] && [ ! -f "${ROOT_DIR:-/dev/null}/requirements.txt" ]; then
+    echo "[x] Không tìm thấy app (app.py/requirements.txt) cho '$APP_NAME'." >&2
+    echo "    Truyền --app-dir /đường/dẫn/dự-an," >&2
+    echo "    hoặc --start-cmd \"<lệnh khởi động>\" cho server không phải Python," >&2
+    echo "    hoặc --no-service nếu chỉ cài DNS." >&2
     exit 1
 fi
+if [ "$CREATE_SERVICE" -eq 1 ] && [ -n "$ROOT_DIR" ]; then
+    [ -d "$ROOT_DIR" ] || { echo "[x] Thư mục app không tồn tại: $ROOT_DIR" >&2; exit 1; }
+fi
+
+# URL WebApp + URL admin Pi-hole (định nghĩa sớm để dùng được ở mọi bước sau).
+APP_URL="http://$DOMAIN"
+[ "$APP_PORT" -eq 80 ] || APP_URL="http://$DOMAIN:$APP_PORT"
 
 c() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
 info() { c "96" "[i] $*"; }
@@ -150,18 +198,32 @@ detect_lan_ip() {
 }
 
 CLI_LAN_IP="${LAN_IP:-}"
-CLI_DOMAIN="${VPS_HOSTNAME:-}"
+ENV_DOMAIN="${VPS_HOSTNAME:-}"
 if [ -f "$SCRIPT_DIR/.env" ]; then
     # shellcheck disable=SC1091
     set -a; . "$SCRIPT_DIR/.env"; set +a
 fi
 LAN_IP="${CLI_LAN_IP:-${LAN_IP:-$(detect_lan_ip)}}"
-DOMAIN="${CLI_DOMAIN:-${VPS_HOSTNAME:-$DOMAIN}}"
+# Thứ tự ưu tiên tên miền: --domain (CLI) > biến môi trường > file .env > mặc định.
+if [ "${DOMAIN_FROM_CLI:-0}" -eq 1 ]; then
+    : # DOMAIN đã lấy từ CLI, giữ nguyên
+elif [ -n "$ENV_DOMAIN" ]; then
+    DOMAIN="$ENV_DOMAIN"
+else
+    DOMAIN="${VPS_HOSTNAME:-$DOMAIN}"
+fi
 [ -n "$LAN_IP" ] || die "Không dò được IP LAN. Chạy: sudo LAN_IP=192.168.x.y ./install-native.sh"
 
 IFACE="$(ip -o -4 addr show | awk -v ip="$LAN_IP" '$4 ~ "^"ip"/" {print $2; exit}')"
 [ -n "$IFACE" ] || die "IP $LAN_IP không thuộc card mạng nào. Kiểm tra: ip -4 addr"
 ok "IP LAN: $LAN_IP (interface: $IFACE), tên miền: $DOMAIN"
+
+# URL quản trị Pi-hole: khi WebApp chiếm cổng 80 thì admin dời sang ADMIN_PORT.
+if [ "$APP_PORT" -eq 80 ]; then
+    ADMIN_URL="http://$LAN_IP:$ADMIN_PORT/admin"
+else
+    ADMIN_URL="http://$LAN_IP/admin"
+fi
 
 # ------------------------------------------------------------------------------
 # 1. File .env dùng chung với phương án Docker
@@ -243,11 +305,6 @@ if [ -f "$VENDOR_INSTALLER" ] && valid_install "$VENDOR_INSTALLER"; then
     fi
 fi
 
-if [ "$GOT" -ne 1 ] && [ ! -f "$INSTALLER" ] && ! valid_install "$INSTALLER"; then
-    # không có gì dùng lại được -> sẽ đi vào vòng tải bên dưới
-    :
-fi
-
 if [ "$GOT" -ne 1 ] && [ -f "$INSTALLER" ] && valid_install "$INSTALLER"; then
     chmod 755 "$INSTALLER"
     ok "Dùng lại installer còn trong /tmp."
@@ -302,6 +359,8 @@ setDNS() {
     PIHOLE_DNS_2="$UP2"
 }
 chooseBlocklists() {
+    # adlistFile do installer Pi-hole định nghĩa khi source.
+    # shellcheck disable=SC2154
     if [ -f "${adlistFile}" ]; then
         mv -f "${adlistFile}" "${adlistFile}.old"
     fi
@@ -312,10 +371,15 @@ setLogging() { QUERY_LOGGING=true; }
 setPrivacyLevel() { PRIVACY_LEVEL=0; }
 dialog() { return 0; }
 
+# shellcheck disable=SC2034  # được installer Pi-hole (đã source) đọc lại
 PIHOLE_INTERFACE="$IFACE"
+# shellcheck disable=SC2034
 PIHOLE_DNS_1="$UP1"
+# shellcheck disable=SC2034
 PIHOLE_DNS_2="$UP2"
+# shellcheck disable=SC2034
 QUERY_LOGGING=true
+# shellcheck disable=SC2034
 PRIVACY_LEVEL=0
 
 main || RC=$?
@@ -356,7 +420,7 @@ systemctl restart pihole-FTL
 info "Chờ Pi-hole trả lời trên $LAN_IP..."
 READY=0
 for _ in $(seq 1 40); do
-    if dig +short +time=1 +tries=1 "@$LAN_IP" "$DOMAIN" 2>/dev/null | grep -qx "$LAN_IP"; then
+    if grep -qx "$LAN_IP" <(dig +short +time=1 +tries=1 "@$LAN_IP" "$DOMAIN" 2>/dev/null); then
         READY=1
         break
     fi
@@ -365,14 +429,14 @@ done
 [ "$READY" -eq 1 ] || warn "Pi-hole chưa trả lời. Xem: journalctl -u pihole-FTL -n 50 --no-pager"
 
 # FTL có bind đúng 192.168.x.y:53 thay vì 0.0.0.0:53 không?
-if ss -lnu 2>/dev/null | grep -qE '(^|[\s:])(0\.0\.0\.0|\*|\[::\]):53\b'; then
+if grep -qE '(^|[\s:])(0\.0\.0\.0|\*|\[::\]):53\b' <(ss -lnu 2>/dev/null); then
     LAN_ONLY=0
 else
     LAN_ONLY=1
 fi
 info "Kiểm tra bind cổng 53: $(ss -lnu 2>/dev/null | awk '/:53[[:space:]]/ {print $4}' | tr '\n' ' ')"
 
-if [ "$APP_PORT" -eq 80 ] && ss -ltn 2>/dev/null | grep -qE ':80[[:space:]]'; then
+if [ "$APP_PORT" -eq 80 ] && grep -qE ':80[[:space:]]' <(ss -ltn 2>/dev/null); then
     warn "Cổng 80 vẫn đang bị chiếm (Pi-hole chưa dời cổng?). Kiểm tra: ss -ltnp | grep ':80 '"
     warn "Có thể đổi tay: pihole-FTL --config webserver.port \"$ADMIN_PORT\" && systemctl restart pihole-FTL"
 fi
@@ -428,30 +492,45 @@ set_root_env() {
     chown "$RUN_USER:$RUN_GROUP" "$f" 2>/dev/null || true
 }
 
+# Tự dò module WSGI cho gunicorn (chỉ áp dụng cho app Python).
+if [ -z "$APP_MODULE" ]; then
+    if [ -f "${ROOT_DIR:-/dev/null}/wsgi.py" ]; then
+        APP_MODULE="wsgi:app"
+    else
+        APP_MODULE="app:app"
+    fi
+fi
+
 if [ "$CREATE_SERVICE" -eq 1 ]; then
     set_root_env
     BIND_ADDR="$(grep -E '^VPS_HOST=' "$ROOT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-)"
     BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
 
-    info "Tạo môi trường Python (.venv) cho WebApp..."
-    if [ ! -x "$ROOT_DIR/.venv/bin/python" ]; then
-        sudo -u "$RUN_USER" -H python3 -m venv "$ROOT_DIR/.venv"
+    if [ -n "$START_CMD" ]; then
+        info "Dùng lệnh khởi động riêng (không tạo venv): $START_CMD"
+        EXEC_LINES="ExecStart=/bin/bash -lc 'exec $START_CMD'"
+    else
+        info "Tạo môi trường Python (.venv) cho WebApp..."
+        if [ ! -x "$ROOT_DIR/.venv/bin/python" ]; then
+            sudo -u "$RUN_USER" -H python3 -m venv "$ROOT_DIR/.venv"
+        fi
+        sudo -u "$RUN_USER" -H "$ROOT_DIR/.venv/bin/pip" install -q --upgrade pip
+        sudo -u "$RUN_USER" -H "$ROOT_DIR/.venv/bin/pip" install -q -r "$ROOT_DIR/requirements.txt"
+        ok "Đã cài thư viện Python."
+        EXEC_LINES="ExecStart=$ROOT_DIR/.venv/bin/gunicorn --bind $BIND_ADDR:$APP_PORT --workers 1 --threads 8 --timeout 180 $APP_MODULE"
     fi
-    sudo -u "$RUN_USER" -H "$ROOT_DIR/.venv/bin/pip" install -q --upgrade pip
-    sudo -u "$RUN_USER" -H "$ROOT_DIR/.venv/bin/pip" install -q -r "$ROOT_DIR/requirements.txt"
-    ok "Đã cài thư viện Python."
 
-    if ss -ltn 2>/dev/null | grep -qE ":${APP_PORT}[[:space:]]" \
-        && ! systemctl is-active --quiet vps-commander; then
+    if grep -qE ":${APP_PORT}[[:space:]]" <(ss -ltn 2>/dev/null) \
+        && ! systemctl is-active --quiet "$APP_NAME"; then
         warn "Cổng $APP_PORT đang bị tiến trình khác dùng. Dừng nó (vd: Ctrl+C ở cửa sổ ./run.sh) rồi chạy lại script."
     else
         CAP_LINES=""
         if [ "$APP_PORT" -lt 1024 ]; then
             CAP_LINES=$'AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE'
         fi
-        cat >/etc/systemd/system/vps-commander.service <<EOF
+        cat >"/etc/systemd/system/$APP_NAME.service" <<EOF
 [Unit]
-Description=VPS Commander WebApp
+Description=WebApp $APP_NAME (theo ten mien noi bo $DOMAIN)
 After=network-online.target pihole-FTL.service
 Wants=network-online.target
 
@@ -461,7 +540,7 @@ User=$RUN_USER
 Group=$RUN_GROUP
 WorkingDirectory=$ROOT_DIR
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$ROOT_DIR/.venv/bin/gunicorn --bind $BIND_ADDR:$APP_PORT --workers 1 --threads 8 --timeout 180 app:app
+$EXEC_LINES
 $CAP_LINES
 Restart=on-failure
 RestartSec=3
@@ -470,25 +549,16 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        systemctl enable vps-commander >/dev/null
-        systemctl restart vps-commander
-        ok "WebApp chạy dưới systemd: $APP_URL (bind $BIND_ADDR:$APP_PORT)"
+        systemctl enable "$APP_NAME" >/dev/null
+        systemctl restart "$APP_NAME"
+        ok "WebApp '$APP_NAME' chạy dưới systemd: $APP_URL (bind $BIND_ADDR:$APP_PORT)"
     fi
-fi
-
-# Định nghĩa URL dùng chung (phải nằm trước mọi lệnh in)
-APP_URL="http://$DOMAIN"
-[ "$APP_PORT" -eq 80 ] || APP_URL="http://$DOMAIN:$APP_PORT"
-if [ "$APP_PORT" -eq 80 ]; then
-    ADMIN_URL="http://$LAN_IP:$ADMIN_PORT/admin"
-else
-    ADMIN_URL="http://$LAN_IP/admin"
 fi
 
 # ------------------------------------------------------------------------------
 # 7.5. Firewall: nếu ufw đang bật, mở cổng cần thiết (DNS + WebApp + admin)
 # ------------------------------------------------------------------------------
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+if command -v ufw >/dev/null 2>&1 && grep -q "Status: active" <(ufw status 2>/dev/null); then
     info "ufw đang bật - mở cổng 53 (tcp/udp), $APP_PORT/tcp, $ADMIN_PORT/tcp..."
     ufw allow 53/tcp >/dev/null
     ufw allow 53/udp >/dev/null
@@ -503,7 +573,7 @@ fi
 echo
 info "Kiểm tra phân giải và kết nối..."
 FAILED=0
-if dig +short +time=2 +tries=1 "@$LAN_IP" "$DOMAIN" | grep -qx "$LAN_IP"; then
+if grep -qx "$LAN_IP" <(dig +short +time=2 +tries=1 "@$LAN_IP" "$DOMAIN"); then
     ok "Pi-hole: $DOMAIN -> $LAN_IP"
 else
     warn "Pi-hole không trả lời đúng cho $DOMAIN"
@@ -515,10 +585,10 @@ else
     warn "Host chưa phân giải được $DOMAIN (thử: resolvectl flush-caches)"
     FAILED=1
 fi
-if curl -s --max-time 5 -o /dev/null "$APP_URL/healthz"; then
+if curl -fsS --max-time 5 -o /dev/null "$APP_URL/healthz"; then
     ok "WebApp trả lời tại $APP_URL"
 else
-    warn "WebApp chưa trả lời (xem: journalctl -u vps-commander -n 50 --no-pager)"
+    warn "WebApp chưa trả lời (xem: journalctl -u $APP_NAME -n 50 --no-pager)"
     FAILED=1
 fi
 
@@ -535,8 +605,8 @@ echo "  DNS nội bộ    : $DOMAIN -> $LAN_IP"
 echo "  Mật khẩu admin: $PIHOLE_PASSWORD   (lưu trong $SCRIPT_DIR/.env)"
 echo
 echo "  Quản lý dịch vụ:"
-echo "    systemctl status pihole-FTL vps-commander"
-echo "    journalctl -u vps-commander -f"
+echo "    systemctl status pihole-FTL $APP_NAME"
+echo "    journalctl -u $APP_NAME -f"
 echo
 echo "  Để cả LAN dùng được: trỏ DNS DHCP của router về $LAN_IP,"
 echo "  và tắt Secure DNS/DoH trong trình duyệt."

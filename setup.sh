@@ -2,7 +2,7 @@
 # ==============================================================================
 # vps-local-dns - Thiết lập tên miền nội bộ bằng Pi-hole (Docker)
 #
-# Script làm 4 việc, chạy lại nhiều lần vẫn an toàn (idempotent):
+# Script làm 5 việc, chạy lại nhiều lần vẫn an toàn (idempotent):
 #   1. Cài Docker + Docker Compose nếu chưa có.
 #   2. Tạo .env (mật khẩu Pi-hole tự sinh).
 #   3. Thêm split-DNS vào systemd-resolved: chỉ riêng tên miền nội bộ đi qua
@@ -55,7 +55,7 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     cat <<'EOF'
 Thiết lập tên miền nội bộ vps.vn bằng Pi-hole (Docker)
 
-Script làm 4 việc, chạy lại nhiều lần vẫn an toàn:
+Script làm 5 việc, chạy lại nhiều lần vẫn an toàn:
   1. Cài Docker + Docker Compose nếu chưa có.
   2. Tạo .env (mật khẩu Pi-hole tự sinh).
   3. Thêm split-DNS vào systemd-resolved: chỉ vps.vn đi qua Pi-hole.
@@ -102,7 +102,7 @@ LAN_IP="${CLI_LAN_IP:-${LAN_IP:-$(detect_lan_ip)}}"
 [ -n "$LAN_IP" ] || die "Không tự dò được IP LAN. Chạy lại với: sudo LAN_IP=192.168.x.y ./setup.sh"
 DOMAIN="${CLI_DOMAIN:-${VPS_HOSTNAME:-$DOMAIN}}"
 
-if ! ip -4 addr show | grep -q "inet ${LAN_IP}/"; then
+if ! grep -q "inet ${LAN_IP}/" <(ip -4 addr show); then
     warn "IP $LAN_IP không gắn với card mạng nào trên máy này."
     read -r -p "Tiếp tục vẫn được, nhưng hãy kiểm tra lại. Tiếp tục? [y/N] " ans
     [[ "${ans:-n}" =~ ^[yY]$ ]] || exit 1
@@ -144,7 +144,7 @@ else
 fi
 
 # Cho phép user thật dùng docker mà không cần sudo ở các lần sau
-if [ -n "${SUDO_USER:-}" ] && ! id -nG "$SUDO_USER" | tr ' ' '\n' | grep -qx docker; then
+if [ -n "${SUDO_USER:-}" ] && ! grep -qx docker <(id -nG "$SUDO_USER" | tr ' ' '\n'); then
     usermod -aG docker "$SUDO_USER"
     warn "Đã thêm $SUDO_USER vào nhóm docker (cần đăng xuất/đăng nhập lại để có hiệu lực)."
 fi
@@ -208,7 +208,7 @@ info "Đang khởi động Pi-hole..."
 
 info "Chờ Pi-hole sẵn sàng (tối đa 120s)..."
 for _ in $(seq 1 60); do
-    if dig +short +time=1 +tries=1 "@$LAN_IP" "$DOMAIN" 2>/dev/null | grep -qx "$LAN_IP"; then
+    if grep -qx "$LAN_IP" <(dig +short +time=1 +tries=1 "@$LAN_IP" "$DOMAIN" 2>/dev/null); then
         break
     fi
     sleep 2
@@ -219,7 +219,7 @@ done
 # ------------------------------------------------------------------------------
 FAILED=0
 
-if dig +short +time=2 +tries=1 "@$LAN_IP" "$DOMAIN" | grep -qx "$LAN_IP"; then
+if grep -qx "$LAN_IP" <(dig +short +time=2 +tries=1 "@$LAN_IP" "$DOMAIN"); then
     ok "Pi-hole trả lời: $DOMAIN -> $LAN_IP"
 else
     warn "Pi-hole chưa trả lời đúng. Xem log: docker compose -f $SCRIPT_DIR/docker-compose.yml logs --tail=50 pihole"
@@ -227,7 +227,7 @@ else
 fi
 
 if command -v resolvectl >/dev/null 2>&1; then
-    if resolvectl query "$DOMAIN" 2>/dev/null | grep -q "$LAN_IP"; then
+    if grep -q "$LAN_IP" <(resolvectl query "$DOMAIN" 2>/dev/null); then
         ok "Host này phân giải $DOMAIN -> $LAN_IP (qua systemd-resolved)."
     else
         warn "Host chưa phân giải được $DOMAIN. Thử: resolvectl flush-caches && resolvectl query $DOMAIN"
@@ -246,10 +246,10 @@ if [ -f "$ROOT_DIR/.env" ]; then
     fi
     info "Đã đặt VPS_HOST=0.0.0.0 trong $ROOT_DIR/.env (cổng 5000 mở ra LAN)."
 
-    if docker ps --format '{{.Names}}' | grep -qx 'vps-commander'; then
+    if grep -qx 'vps-commander' <(docker ps --format '{{.Names}}' 2>/dev/null); then
         info "Khởi động lại vps-commander để áp dụng cổng mới..."
         ( cd "$ROOT_DIR" && "${COMPOSE[@]}" up -d )
-    elif curl -s --max-time 3 -o /dev/null http://127.0.0.1:5000/healthz; then
+    elif curl -fsS --max-time 3 -o /dev/null http://127.0.0.1:5000/healthz; then
         warn "WebApp đang chạy NGOÀI Docker (./run.sh). Hãy Ctrl+C rồi chạy lại ./run.sh"
         warn "để nó bind 0.0.0.0:5000 (đã đặt trong .env)."
     else
@@ -264,7 +264,7 @@ fi
 # ------------------------------------------------------------------------------
 # 8. Gợi ý firewall
 # ------------------------------------------------------------------------------
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+if command -v ufw >/dev/null 2>&1 && grep -qi '^Status: active' <(ufw status 2>/dev/null); then
     if [ "${ALLOW_UFW:-0}" = "1" ]; then
         ufw allow 53/udp >/dev/null && ufw allow 53/tcp >/dev/null
         ufw allow 80/tcp >/dev/null && ufw allow 5000/tcp >/dev/null
