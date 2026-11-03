@@ -1,0 +1,5 @@
+# Cấu hình cục bộ (chứa mật khẩu) - không commit
+.env
+
+# Dữ liệu Pi-hole khi chạy Docker (snapshot /etc/pihole)
+etc-pihole/

@@ -1,0 +1,61 @@
+# ==========================================================================
+# Pi-hole cho tên miền nội bộ (vps.vn) - CHỈ chạy trong LAN
+#
+# Chạy:
+#   cd thư mục kit (nơi chứa file này)
+#   cp .env.example .env        # rồi sửa LAN_IP / PIHOLE_PASSWORD
+#   docker compose up -d
+#
+# Hoặc dùng script tự động (cài Docker, cấu hình split-DNS, kiểm tra):
+#   sudo ./setup.sh
+#
+# Điểm quan trọng: Pi-hole KHÔNG chiếm 0.0.0.0:53. Nó chỉ bind cổng 53
+# trên IP LAN, nên systemd-resolved (127.0.0.53:53) và Tailscale MagicDNS
+# vẫn hoạt động bình thường.
+# ==========================================================================
+name: vps-local-dns
+
+services:
+  pihole:
+    image: pihole/pihole:latest
+    container_name: pihole
+    hostname: pihole
+    restart: unless-stopped
+
+    ports:
+      # DNS chỉ mở trên IP LAN -> không đụng systemd-resolved (127.0.0.53)
+      - "${LAN_IP:?Chưa đặt LAN_IP trong .env}:53:53/tcp"
+      - "${LAN_IP:?Chưa đặt LAN_IP trong .env}:53:53/udp"
+      # Giao diện quản trị: http://<LAN_IP>/admin
+      - "80:80/tcp"
+
+    environment:
+      TZ: "${TZ:-Asia/Ho_Chi_Minh}"
+      # Mật khẩu web admin. Không đặt -> Pi-hole tự sinh và in ra log.
+      FTLCONF_webserver_api_password: "${PIHOLE_PASSWORD:?Chưa đặt PIHOLE_PASSWORD trong .env}"
+      # DNS upstream (Pi-hole hỏi tiếp ra Internet). Không trỏ về chính nó.
+      FTLCONF_dns_upstreams: "${UPSTREAM_DNS:-1.1.1.1;1.0.0.1}"
+      # Bắt buộc khi chạy bridge network: nhận truy vấn từ mọi interface.
+      FTLCONF_dns_listeningMode: "ALL"
+      # Bản ghi DNS nội bộ: vps.vn (và mọi subdomain) -> IP LAN của máy này.
+      FTLCONF_misc_dnsmasq_lines: "address=/${VPS_HOSTNAME:-vps.vn}/${LAN_IP}"
+      # NGINX/lighttpd không cần: Pi-hole v6 tự phục vụ web UI.
+      FTLCONF_webserver_port: "80"
+
+    volumes:
+      - ./etc-pihole:/etc/pihole
+
+    # Container không dùng 127.0.0.1 làm DNS (không có ý nghĩa trong container).
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+
+    cap_add:
+      - NET_ADMIN
+
+    # Pi-hole ghi log khá nhiều; giữ log gọn để không đầy đĩa.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
